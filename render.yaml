@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: blubase-agent
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: BLUBASE_API_KEY
+        sync: false
+      - key: AGENT_LLM_API_KEY
+        sync: false
+      - key: AGENT_LLM_BASE_URL
+        sync: false
+      - key: AGENT_LLM_MODEL
+        value: gpt-4o-mini
+      - key: POCKETBASE_URL
+        sync: false
+      - key: POCKETBASE_EMAIL
+        sync: false
+      - key: POCKETBASE_PASSWORD
+        sync: false
+      - key: SILOBASE_URL
+        sync: false
+      - key: SILOBASE_EMAIL
+        sync: false
+      - key: SILOBASE_PASSWORD
+        sync: false
+      - key: CUSTOM_BACKEND_URL
+        sync: false
+      - key: CUSTOM_BACKEND_TOKEN
+        sync: false

@@ -1,0 +1,16 @@
+{
+  "name": "blubase-agent",
+  "version": "1.0.0",
+  "description": "Agentic backend powered by PocketBase, SiloBase and custom REST backends",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pocketbase": "^0.21.5"
+  }
+}
