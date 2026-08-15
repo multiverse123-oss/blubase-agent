@@ -12,9 +12,9 @@ services:
       - key: AGENT_LLM_API_KEY
         sync: false
       - key: AGENT_LLM_BASE_URL
-        sync: false
+        value: https://api.mistral.ai/v1
       - key: AGENT_LLM_MODEL
-        value: gpt-4o-mini
+        value: mistral-small-latest
       - key: POCKETBASE_URL
         sync: false
       - key: POCKETBASE_EMAIL
@@ -30,4 +30,16 @@ services:
       - key: CUSTOM_BACKEND_URL
         sync: false
       - key: CUSTOM_BACKEND_TOKEN
+        sync: false
+      - key: IDRIVE_E2_ACCESS_KEY_ID
+        sync: false
+      - key: IDRIVE_E2_SECRET_ACCESS_KEY
+        sync: false
+      - key: IDRIVE_E2_BUCKET_NAME
+        sync: false
+      - key: IDRIVE_E2_ENDPOINT
+        sync: false
+      - key: IDRIVE_E2_REGION
+        sync: false
+      - key: RENDER_API_KEY
         sync: false
