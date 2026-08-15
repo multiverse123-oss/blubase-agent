@@ -1,7 +1,10 @@
 require('dotenv').config();
+const fs = require('fs');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const express = require('express');
 const cors = require('cors');
-const PocketBase = require('pocketbase');
+const PocketBaseModule = require('pocketbase');
+const PocketBase = PocketBaseModule.PocketBase || PocketBaseModule.default || PocketBaseModule;
 const { randomUUID } = require('crypto');
 
 const app = express();
@@ -19,12 +22,90 @@ const config = {
 };
 
 // ---------- Connection Manager ----------
+const CONN_FILE = './data/connections.json';
 const connections = new Map();
 
-function addConnection({ type, name, url, email, password, token }) {
+// S3 client for persistence
+const s3 = new S3Client({
+  region: process.env.IDRIVE_E2_REGION || 'us-west-4',
+  endpoint: process.env.IDRIVE_E2_ENDPOINT || 'https://s3.us-west-4.idrivee2.com',
+  credentials: {
+    accessKeyId: process.env.IDRIVE_E2_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.IDRIVE_E2_SECRET_ACCESS_KEY || '',
+  },
+  forcePathStyle: true, // required for iDrive E2
+});
+
+const BUCKET = process.env.IDRIVE_E2_BUCKET_NAME || '';
+const KEY = 'connections.json';
+
+async function loadFromS3() {
+  if (!BUCKET) return null;
+  try {
+    const command = new GetObjectCommand({ Bucket: BUCKET, Key: KEY });
+    const data = await s3.send(command);
+    const body = await data.Body?.transformToString();
+    return JSON.parse(body || '[]');
+  } catch (err) {
+    console.error('S3 load error:', err.message);
+    return null;
+  }
+}
+
+async function saveToS3(arr) {
+  if (!BUCKET) return false;
+  try {
+    const command = new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: KEY,
+      Body: JSON.stringify(arr, null, 2),
+      ContentType: 'application/json',
+    });
+    await s3.send(command);
+    console.log('Saved connections to S3');
+    return true;
+  } catch (err) {
+    console.error('S3 save error:', err.message);
+    return false;
+  }
+}
+
+async function loadConnections() {
+  // 1. Try S3 first
+  const s3Data = await loadFromS3();
+  if (s3Data) {
+    for (const conn of s3Data) connections.set(conn.id, conn);
+    console.log('Loaded', connections.size, 'connections from S3');
+    return;
+  }
+  // 2. Fallback to local file
+  if (fs.existsSync(CONN_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(CONN_FILE, 'utf8'));
+      for (const conn of data) connections.set(conn.id, conn);
+      console.log('Loaded', connections.size, 'connections from local file');
+    } catch (e) {
+      console.error('Failed to load local connections:', e.message);
+    }
+  }
+}
+
+async function saveConnections() {
+  const arr = Array.from(connections.values());
+  // Save to S3 (and also to local file for dev)
+  const s3Saved = await saveToS3(arr);
+  if (!s3Saved) {
+    if (!fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
+    fs.writeFileSync(CONN_FILE, JSON.stringify(arr, null, 2));
+    console.log('Saved', arr.length, 'connections to local file');
+  }
+}
+
+async function addConnection({ type, name, url, email, password, token }) {
   const id = randomUUID();
   const conn = { id, type, name: name || type, url: url.replace(/\/$/, ''), email, password, token, createdAt: new Date().toISOString() };
   connections.set(id, conn);
+  await saveConnections();
   return conn;
 }
 
@@ -50,6 +131,12 @@ if (process.env.CUSTOM_BACKEND_URL) {
   addConnection({ type: 'custom', name: 'custom', url: process.env.CUSTOM_BACKEND_URL, email: process.env.CUSTOM_BACKEND_EMAIL, password: process.env.CUSTOM_BACKEND_PASSWORD, token: process.env.CUSTOM_BACKEND_TOKEN });
 }
 
+// Load any persisted connections (in case env preloads already added some, we'll merge)
+(async () => {
+  await loadConnections();
+  console.log('Connections loaded');
+})();
+
 // ---------- Adapters ----------
 class PocketBaseAdapter {
   constructor(conn) { this.conn = conn; this.pb = new PocketBase(conn.url); this.pb.autoCancellation(false); }
@@ -65,7 +152,21 @@ class PocketBaseAdapter {
   async update(collection, id, data) { await this.auth(); return this.pb.collection(collection).update(id, data); }
   async delete(collection, id) { await this.auth(); return this.pb.collection(collection).delete(id); }
   async getCollections() { await this.auth(); return this.pb.collections.getFullList(); }
-  async createCollection(schema) { await this.auth(); return this.pb.collections.create(schema); }
+  async createCollection(schema) {
+    await this.auth();
+    if (schema.fields && !schema.schema) { schema.schema = schema.fields; delete schema.fields; }
+    if (!schema.type) schema.type = 'base';
+    if (!schema.schema) schema.schema = [];
+    schema.schema = schema.schema.map(field => ({
+      name: field.name,
+      type: field.type || 'text',
+      required: field.required || false,
+      presentable: field.presentable || false,
+      unique: field.unique || false,
+      options: field.options || {}
+    }));
+    return this.pb.collections.create(schema);
+  }
   async callEdgeFunction(name, payload) { await this.auth(); return this.pb.send(`/api/functions/${name}`, { method: 'POST', body: payload, headers: { 'Content-Type': 'application/json' } }); }
 }
 
@@ -112,7 +213,7 @@ async function interpretCommand(message, conns) {
 Actions: connect, list_collections, create_collection, list_records, create_record, update_record, delete_record, call_edge_function, help.
 For connect: {action:"connect", backend:"pocketbase|silobase|custom", name, url, email, password, token}
 For list_collections: {action:"list_collections", backend:"name|id"}
-For create_collection: {action:"create_collection", backend, schema:{name, fields:[...]}}
+For create_collection: {action:"create_collection", backend, schema:{name:"collection_name", type:"base", schema:[{name:"field_name", type:"text", required:false, presentable:false, unique:false, options:{min:null,max:null,pattern:""}}]}}
 For list_records: {action:"list_records", backend, collection, query:{page,perPage,filter,sort}}
 For create_record: {action:"create_record", backend, collection, data:{}}
 For update_record: {action:"update_record", backend, collection, id, data:{}}
@@ -226,6 +327,12 @@ app.get('/', (_req, res) => res.json({
 }));
 
 // Error handler
-app.use((err, _req, res, _next) => { console.error(err); res.status(500).json({ error: err.message || 'Internal server error' }); });
+app.use((err, _req, res, _next) => {
+    console.error('ERROR:', err);
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || 'Internal server error';
+    const details = err.response?.data || err.data || null;
+    res.status(status).json({ error: message, details });
+  });
 
 app.listen(config.port, () => console.log(`🚀 BluBase Agent running on port ${config.port}`));
