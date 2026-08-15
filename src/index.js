@@ -14,6 +14,11 @@ app.use(express.json());
 const config = {
   port: process.env.PORT || 3000,
   apiKey: process.env.BLUBASE_API_KEY || '',
+  render: {
+    apiKey: process.env.RENDER_API_KEY || '',
+    pocketbaseImage: process.env.POCKETBASE_IMAGE || 'pocketbase/pocketbase:latest',
+    diskSizeGB: Number(process.env.POCKETBASE_DISK_GB) || 1,
+  },
   llm: {
     apiKey: process.env.AGENT_LLM_API_KEY || '',
     baseUrl: (process.env.AGENT_LLM_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
@@ -199,6 +204,96 @@ class RestAdapter {
 }
 
 function getAdapter(conn) { return conn.type === 'pocketbase' ? new PocketBaseAdapter(conn) : new RestAdapter(conn); }
+
+// ---------- Provisioning ----------
+async function provisionBackend(name = '') {
+  if (!config.render.apiKey) throw new Error('RENDER_API_KEY not set');
+  const serviceName = (name || 'pb-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const adminEmail = 'admin@' + serviceName + '.com';
+  const adminPassword = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+
+  const renderBody = {
+    type: 'web_service',
+    name: serviceName,
+    env: 'node',
+    plan: 'free',
+    region: 'oregon',
+    serviceDetails: {
+      image: {
+        registry: 'docker.io',
+        image: config.render.pocketbaseImage.split(':')[0],
+        tag: config.render.pocketbaseImage.split(':')[1] || 'latest',
+      },
+      envVars: [
+        { key: 'POCKETBASE_ADMIN_EMAIL', value: adminEmail },
+        { key: 'POCKETBASE_ADMIN_PASSWORD', value: adminPassword },
+        { key: 'POCKETBASE_HTTP_PORT', value: '80' },
+      ],
+      disk: {
+        name: 'pb-data',
+        mountPath: '/pb_data',
+        sizeGB: config.render.diskSizeGB,
+      },
+    },
+  };
+
+  const response = await fetch('https://api.render.com/v1/services', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + config.render.apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(renderBody),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error('Render API error: ' + response.status + ' ' + text);
+  }
+
+  const service = await response.json();
+  const serviceId = service.id;
+
+  // Poll for service URL
+  let url = null;
+  for (let i = 0; i < 30; i++) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    const statusRes = await fetch('https://api.render.com/v1/services/' + serviceId, {
+      headers: { 'Authorization': 'Bearer ' + config.render.apiKey },
+    });
+    if (statusRes.ok) {
+      const statusData = await statusRes.json();
+      if (statusData.service && statusData.service.serviceDetails && statusData.service.serviceDetails.url) {
+        url = statusData.service.serviceDetails.url;
+        break;
+      }
+    }
+  }
+
+  if (!url) throw new Error('Timed out waiting for service URL');
+
+  // Connect to the new PocketBase instance
+  const conn = await addConnection({
+    type: 'pocketbase',
+    name: serviceName,
+    url: url,
+    email: adminEmail,
+    password: adminPassword,
+  });
+
+  return {
+    success: true,
+    message: 'Backend provisioned successfully',
+    connection: {
+      id: conn.id,
+      type: conn.type,
+      name: conn.name,
+      url: conn.url,
+      email: adminEmail,
+      password: adminPassword,
+    },
+  };
+}
 function findBackend(backend) {
   if (backend) { const conn = getConnection(backend); if (conn) return conn; }
   const all = Array.from(connections.values());
@@ -211,6 +306,7 @@ async function interpretCommand(message, conns) {
   if (!config.llm.apiKey) throw new Error('AGENT_LLM_API_KEY not set');
   const system = `You are BluBase Agent. Convert user request to JSON action. Available backends: ${JSON.stringify(conns.map(c => ({ id: c.id, name: c.name, type: c.type, url: c.url })))}.
 Actions: connect, list_collections, create_collection, list_records, create_record, update_record, delete_record, call_edge_function, help.
+For provision_backend: {action:"provision_backend", name:"optional-name"}
 For connect: {action:"connect", backend:"pocketbase|silobase|custom", name, url, email, password, token}
 For list_collections: {action:"list_collections", backend:"name|id"}
 For create_collection: {action:"create_collection", backend, schema:{name:"collection_name", type:"base", schema:[{name:"field_name", type:"text", required:false, presentable:false, unique:false, options:{min:null,max:null,pattern:""}}]}}
@@ -235,6 +331,10 @@ async function runAgent(message) {
   const conns = Array.from(connections.values());
   const action = await interpretCommand(message, conns);
   switch (action.action) {
+    case 'provision_backend': {
+      const result = await provisionBackend(action.name);
+      return result;
+    }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
       const conn = addConnection({ type: action.backend || 'custom', name: action.name, url: action.url, email: action.email, password: action.password, token: action.token });
@@ -264,6 +364,14 @@ function requireApiKey(req, res, next) {
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'blubase-agent', connections: listConnections() }));
 
 app.use(requireApiKey);
+
+app.post('/provision', async (req, res, next) => {
+  try {
+    const { name } = req.body;
+    const result = await provisionBackend(name);
+    res.json(result);
+  } catch (err) { next(err); }
+});
 
 app.post('/connect', async (req, res, next) => {
   try {
