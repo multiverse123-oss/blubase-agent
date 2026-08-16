@@ -2,11 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const path = require('path');
 const { randomUUID } = require('crypto');
 const { spawn, execSync } = require('child_process');
 const PocketBaseModule = require('pocketbase');
 const PocketBase = PocketBaseModule.default || PocketBaseModule.PocketBase || PocketBaseModule;
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 const app = express();
 app.use(cors());
@@ -22,10 +23,7 @@ const config = {
   }
 };
 
-// ---------- Connection Manager ----------
-const CONN_FILE = './data/connections.json';
-const connections = new Map();
-
+// ---------- S3 Client ----------
 const s3 = new S3Client({
   region: process.env.IDRIVE_E2_REGION || 'us-west-4',
   endpoint: process.env.IDRIVE_E2_ENDPOINT || 'https://s3.us-west-4.idrivee2.com',
@@ -38,54 +36,42 @@ const s3 = new S3Client({
 const BUCKET = process.env.IDRIVE_E2_BUCKET_NAME || '';
 const KEY = 'connections.json';
 
-async function loadFromS3() {
-  if (!BUCKET) return null;
-  try {
-    const command = new GetObjectCommand({ Bucket: BUCKET, Key: KEY });
-    const data = await s3.send(command);
-    const body = await data.Body?.transformToString();
-    return JSON.parse(body || '[]');
-  } catch { return null; }
-}
-
-async function saveToS3(arr) {
+async function s3Put(key, body) {
   if (!BUCKET) return false;
   try {
-    const command = new PutObjectCommand({ Bucket: BUCKET, Key: KEY, Body: JSON.stringify(arr, null, 2), ContentType: 'application/json' });
-    await s3.send(command);
+    await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
     return true;
   } catch { return false; }
 }
+async function s3Get(key) {
+  if (!BUCKET) return null;
+  try {
+    const data = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    return await data.Body?.transformToString();
+  } catch { return null; }
+}
+
+// ---------- Connection Manager ----------
+const connections = new Map();
 
 async function loadConnections() {
-  const s3Data = await loadFromS3();
-  if (s3Data) {
-    for (const conn of s3Data) connections.set(conn.id, conn);
+  const data = await s3Get(KEY);
+  if (data) {
+    for (const conn of JSON.parse(data)) connections.set(conn.id, conn);
     console.log(`Loaded ${connections.size} connections from S3`);
-    return;
-  }
-  if (fs.existsSync(CONN_FILE)) {
-    const data = JSON.parse(fs.readFileSync(CONN_FILE, 'utf8'));
-    for (const conn of data) connections.set(conn.id, conn);
-    console.log(`Loaded ${connections.size} connections from local file`);
   }
 }
 
 async function saveConnections() {
   const arr = Array.from(connections.values());
-  const saved = await saveToS3(arr);
-  if (!saved) {
-    if (!fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify(arr, null, 2));
-    console.log('Saved to local file');
-  } else {
-    console.log('Saved to S3');
-  }
+  const saved = await s3Put(KEY, JSON.stringify(arr, null, 2));
+  if (saved) console.log('Saved connections to S3');
+  else console.log('Failed to save connections');
 }
 
-async function addConnection({ type, name, url, email, password, token }) {
+async function addConnection({ type, name, url, email, password, token, localUrl }) {
   const id = randomUUID();
-  const conn = { id, type, name: name || type, url: url.replace(/\/$/, ''), email, password, token, createdAt: new Date().toISOString() };
+  const conn = { id, type, name: name || type, url: url.replace(/\/$/, ''), email, password, token, localUrl, createdAt: new Date().toISOString() };
   connections.set(id, conn);
   await saveConnections();
   return conn;
@@ -99,12 +85,69 @@ function getConnection(idOrName) {
 }
 
 function listConnections() {
-  return Array.from(connections.values()).map(({ password, token, ...safe }) => safe);
+  return Array.from(connections.values()).map(({ password, token, localUrl, ...safe }) => safe);
 }
 
-// ---------- Adapters ----------
+// ---------- Local PocketBase Instances ----------
+const instances = new Map(); // name -> { port, process, dir, connId }
+
+async function startLocalInstance(conn) {
+  const existing = instances.get(conn.name);
+  if (existing) return existing;
+
+  const dir = `./pb_instances/${conn.name}`;
+  fs.mkdirSync(dir, { recursive: true });
+
+  // Restore from S3 if exists
+  const dbData = await s3Get(`backends/${conn.name}/data.db`);
+  if (dbData) {
+    // S3 stores as JSON string, but we need binary. We'll store as base64
+    const base64 = JSON.parse(dbData).base64;
+    fs.writeFileSync(path.join(dir, 'data.db'), Buffer.from(base64, 'base64'));
+  }
+
+  // Find free port
+  const net = require('net');
+  let port = 8091;
+  while (true) {
+    const server = net.createServer();
+    const isFree = await new Promise(resolve => {
+      server.once('error', () => resolve(false));
+      server.once('listening', () => { server.close(() => resolve(true)); });
+      server.listen(port, '127.0.0.1');
+    });
+    if (isFree) break;
+    port++;
+  }
+
+  const pbBinary = './pocketbase';
+  if (!fs.existsSync(pbBinary)) throw new Error('pocketbase binary not found');
+
+  const child = spawn(pbBinary, ['serve', `--http=127.0.0.1:${port}`, `--dir=${dir}`], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+  await new Promise(resolve => setTimeout(resolve, 3000));
+
+  instances.set(conn.name, { port, process: child, dir, connId: conn.id });
+  return { port, url: `http://127.0.0.1:${port}` };
+}
+
+async function persistInstance(name) {
+  const inst = instances.get(name);
+  if (!inst) return;
+  const dbFile = path.join(inst.dir, 'data.db');
+  if (fs.existsSync(dbFile)) {
+    const base64 = fs.readFileSync(dbFile).toString('base64');
+    await s3Put(`backends/${name}/data.db`, JSON.stringify({ base64 }));
+    console.log(`Persisted ${name} to S3`);
+  }
+}
+
+// Adapters (same as before, but using localUrl for internal operations)
 class PocketBaseAdapter {
-  constructor(conn) { this.conn = conn; this.pb = new PocketBase(conn.url); this.pb.autoCancellation(false); }
+  constructor(conn) { this.conn = conn; this.pb = new PocketBase(conn.localUrl || conn.url); this.pb.autoCancellation(false); }
   async auth() {
     if (this.pb.authStore.isValid) return;
     if (this.conn.token) { this.pb.authStore.save(this.conn.token, null); return; }
@@ -157,7 +200,7 @@ class RestAdapter {
 
 function getAdapter(conn) { return conn.type === 'pocketbase' ? new PocketBaseAdapter(conn) : new RestAdapter(conn); }
 
-// ---------- LLM Agent ----------
+// LLM Agent (same as before)
 async function interpretCommand(message, conns) {
   if (!config.llm.apiKey) throw new Error('AGENT_LLM_API_KEY not set');
   const system = `You are BluBase Agent. Convert user request to JSON action.
@@ -189,11 +232,16 @@ async function runAgent(message) {
   const action = await interpretCommand(message, conns);
   switch (action.action) {
     case 'provision_backend': {
-      return await provisionDockerBackend(action.name);
+      return await provisionLocalBackend(action.name);
     }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
       const conn = await addConnection({ type: action.backend || 'custom', name: action.name, url: action.url, email: action.email, password: action.password, token: action.token });
+      if (conn.type === 'pocketbase') {
+        await startLocalInstance(conn);
+        conn.localUrl = (await startLocalInstance(conn)).url;
+        await saveConnections();
+      }
       const adapter = getAdapter(conn);
       await adapter.auth();
       return { success: true, message: `Connected ${conn.name} (${conn.type})`, connection: { id: conn.id, type: conn.type, name: conn.name, url: conn.url } };
@@ -216,17 +264,22 @@ async function runAgent(message) {
     case 'create_record': {
       const conn = findBackend(action.backend);
       const adapter = getAdapter(conn);
-      return { success: true, backend: conn.name, collection: action.collection, record: await adapter.create(action.collection || '', action.data) };
+      const result = await adapter.create(action.collection || '', action.data);
+      await persistInstance(conn.name);
+      return { success: true, backend: conn.name, collection: action.collection, record: result };
     }
     case 'update_record': {
       const conn = findBackend(action.backend);
       const adapter = getAdapter(conn);
-      return { success: true, backend: conn.name, collection: action.collection, record: await adapter.update(action.collection || '', action.id || '', action.data) };
+      const result = await adapter.update(action.collection || '', action.id || '', action.data);
+      await persistInstance(conn.name);
+      return { success: true, backend: conn.name, collection: action.collection, record: result };
     }
     case 'delete_record': {
       const conn = findBackend(action.backend);
       const adapter = getAdapter(conn);
       await adapter.delete(action.collection || '', action.id || '');
+      await persistInstance(conn.name);
       return { success: true, backend: conn.name, collection: action.collection, deletedId: action.id };
     }
     case 'call_edge_function': {
@@ -251,11 +304,14 @@ function findBackend(backend) {
   throw new Error(backend ? `Backend "${backend}" not found` : 'No backend specified and multiple backends available');
 }
 
-// ---------- Docker Provisioning ----------
-async function provisionDockerBackend(name = '') {
+// Provisioning: create local PocketBase instance and expose via path URL
+async function provisionLocalBackend(name = '') {
   const serviceName = (name || 'pb-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
   const adminEmail = 'admin@' + serviceName + '.com';
   const adminPassword = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+
+  const dir = `./pb_instances/${serviceName}`;
+  fs.mkdirSync(dir, { recursive: true });
 
   // Find free port
   const net = require('net');
@@ -271,53 +327,84 @@ async function provisionDockerBackend(name = '') {
     port++;
   }
 
-  const containerName = 'blubase-' + serviceName;
-  try { execSync('docker rm -f ' + containerName, { stdio: 'ignore' }); } catch (e) {}
+  const pbBinary = './pocketbase';
+  if (!fs.existsSync(pbBinary)) throw new Error('pocketbase binary not found');
 
-  const dockerCmd = `docker run -d --name ${containerName} --network host -v ${serviceName}_pb_data:/pb_data -e POCKETBASE_ADMIN_EMAIL=${adminEmail} -e POCKETBASE_ADMIN_PASSWORD=${adminPassword} blubase-pocketbase:latest /app/pocketbase serve --http=0.0.0.0:${port}`;
-  execSync(dockerCmd, { stdio: 'pipe' });
-  await new Promise(resolve => setTimeout(resolve, 5000));
+  const child = spawn(pbBinary, ['serve', `--http=127.0.0.1:${port}`, `--dir=${dir}`], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+  await new Promise(resolve => setTimeout(resolve, 3000));
 
-  const url = `http://127.0.0.1:${port}`;
+  try {
+    execSync(`${pbBinary} admin create ${adminEmail} ${adminPassword} --dir=${dir}`, { stdio: 'ignore' });
+  } catch (e) {}
+
+  const publicUrl = `https://blubase-agent.onrender.com/backend/${serviceName}`;
   const conn = await addConnection({
     type: 'pocketbase',
     name: serviceName,
-    url: url,
+    url: publicUrl,
     email: adminEmail,
     password: adminPassword,
+    localUrl: `http://127.0.0.1:${port}`
   });
+
+  instances.set(serviceName, { port, process: child, dir, connId: conn.id });
 
   return {
     success: true,
-    message: 'Backend provisioned via Docker',
+    message: 'Backend created',
     connection: {
       id: conn.id,
       type: conn.type,
       name: conn.name,
-      url: conn.url,
+      url: publicUrl,
       email: adminEmail,
-      password: adminPassword,
-    },
+      password: adminPassword
+    }
   };
 }
 
-// ---------- Middleware ----------
-function requireApiKey(req, res, next) {
+// ---------- Proxy route for /backend/:name ----------
+app.use('/backend/:name', async (req, res, next) => {
+  const name = req.params.name;
+  const inst = instances.get(name);
+  if (!inst) return res.status(404).json({ error: 'Backend not found' });
+  const target = `http://127.0.0.1:${inst.port}${req.url.replace(`/backend/${name}`, '') || '/'}`;
+  try {
+    const fetchRes = await fetch(target, {
+      method: req.method,
+      headers: { ...req.headers, host: `127.0.0.1:${inst.port}` },
+      body: ['GET','HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body),
+    });
+    const data = await fetchRes.text();
+    res.status(fetchRes.status).set('Content-Type', fetchRes.headers.get('content-type') || 'application/json').send(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------- API routes (same as before) ----------
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'blubase-agent', connections: listConnections() }));
+
+app.use((req, res, next) => {
   if (!config.apiKey) return next();
   if (req.header('x-api-key') !== config.apiKey) return res.status(401).json({ error: 'Invalid or missing x-api-key header' });
   next();
-}
-
-// ---------- Routes ----------
-app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'blubase-agent', connections: listConnections() }));
-
-app.use(requireApiKey);
+});
 
 app.post('/connect', async (req, res, next) => {
   try {
     const { backend, name, url, email, password, token } = req.body;
     if (!backend || !url) return res.status(400).json({ error: 'backend and url are required' });
     const conn = await addConnection({ type: backend, name, url, email, password, token });
+    if (backend === 'pocketbase') {
+      await startLocalInstance(conn);
+      conn.localUrl = (await startLocalInstance(conn)).url;
+      await saveConnections();
+    }
     const adapter = getAdapter(conn);
     await adapter.auth();
     res.json({ success: true, connection: { id: conn.id, type: conn.type, name: conn.name, url: conn.url } });
@@ -337,7 +424,7 @@ app.post('/agent/command', async (req, res, next) => {
 app.post('/provision', async (req, res, next) => {
   try {
     const { name } = req.body;
-    res.json(await provisionDockerBackend(name));
+    res.json(await provisionLocalBackend(name));
   } catch (err) { next(err); }
 });
 
@@ -345,13 +432,13 @@ app.get('/proxy/:backend/:collection', async (req, res, next) => {
   try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); res.json(await adapter.list(req.params.collection, req.query)); } catch (err) { next(err); }
 });
 app.post('/proxy/:backend/:collection', async (req, res, next) => {
-  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); res.status(201).json(await adapter.create(req.params.collection, req.body)); } catch (err) { next(err); }
+  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); res.status(201).json(await adapter.create(req.params.collection, req.body)); await persistInstance(conn.name); } catch (err) { next(err); }
 });
 app.patch('/proxy/:backend/:collection/:id', async (req, res, next) => {
-  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); res.json(await adapter.update(req.params.collection, req.params.id, req.body)); } catch (err) { next(err); }
+  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); res.json(await adapter.update(req.params.collection, req.params.id, req.body)); await persistInstance(conn.name); } catch (err) { next(err); }
 });
 app.delete('/proxy/:backend/:collection/:id', async (req, res, next) => {
-  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); await adapter.delete(req.params.collection, req.params.id); res.json({ success: true }); } catch (err) { next(err); }
+  try { const conn = findBackend(req.params.backend); const adapter = getAdapter(conn); await adapter.delete(req.params.collection, req.params.id); await persistInstance(conn.name); res.json({ success: true }); } catch (err) { next(err); }
 });
 
 app.get('/meta/:backend/collections', async (req, res, next) => {
@@ -375,7 +462,8 @@ app.get('/', (_req, res) => res.json({
     provision: 'POST /provision',
     proxy: 'GET|POST|PATCH|DELETE /proxy/:backend/:collection',
     meta: 'GET|POST /meta/:backend/collections',
-    edge: 'POST /edge/:backend/:function'
+    edge: 'POST /edge/:backend/:function',
+    backend: 'GET|POST|PATCH|DELETE /backend/:name/*'
   }
 }));
 
@@ -384,8 +472,18 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
-// Load connections on startup
+// Startup: load connections, start local instances
 (async () => {
   await loadConnections();
+  for (const conn of connections.values()) {
+    if (conn.type === 'pocketbase' && conn.localUrl) {
+      try {
+        await startLocalInstance(conn);
+        console.log(`Started local instance ${conn.name}`);
+      } catch (e) {
+        console.error(`Failed to start ${conn.name}:`, e.message);
+      }
+    }
+  }
   app.listen(config.port, () => console.log(`🚀 BluBase Agent running on port ${config.port}`));
 })();
