@@ -19,8 +19,7 @@ const config = {
     apiKey: process.env.AGENT_LLM_API_KEY || '',
     baseUrl: (process.env.AGENT_LLM_BASE_URL || 'https://api.mistral.ai/v1').replace(/\/$/, ''),
     model: process.env.AGENT_LLM_MODEL || 'mistral-small-latest'
-  },
-  pocketbaseImage: process.env.POCKETBASE_IMAGE || 'pocketbase/pocketbase:latest'
+  }
 };
 
 // ---------- Connection Manager ----------
@@ -52,12 +51,7 @@ async function loadFromS3() {
 async function saveToS3(arr) {
   if (!BUCKET) return false;
   try {
-    const command = new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: KEY,
-      Body: JSON.stringify(arr, null, 2),
-      ContentType: 'application/json'
-    });
+    const command = new PutObjectCommand({ Bucket: BUCKET, Key: KEY, Body: JSON.stringify(arr, null, 2), ContentType: 'application/json' });
     await s3.send(command);
     return true;
   } catch { return false; }
@@ -91,16 +85,7 @@ async function saveConnections() {
 
 async function addConnection({ type, name, url, email, password, token }) {
   const id = randomUUID();
-  const conn = {
-    id,
-    type,
-    name: name || type,
-    url: url.replace(/\/$/, ''),
-    email,
-    password,
-    token,
-    createdAt: new Date().toISOString()
-  };
+  const conn = { id, type, name: name || type, url: url.replace(/\/$/, ''), email, password, token, createdAt: new Date().toISOString() };
   connections.set(id, conn);
   await saveConnections();
   return conn;
@@ -178,8 +163,8 @@ async function interpretCommand(message, conns) {
   const system = `You are BluBase Agent. Convert user request to JSON action.
 Available backends: ${JSON.stringify(conns.map(c => ({ id: c.id, name: c.name, type: c.type, url: c.url })))}.
 Actions:
-- connect: {action:"connect", backend:"pocketbase|silobase|custom", name, url, email, password, token}
 - provision_backend: {action:"provision_backend", name:"optional-name"}
+- connect: {action:"connect", backend:"pocketbase|silobase|custom", name, url, email, password, token}
 - list_collections: {action:"list_collections", backend:"name|id"}
 - create_collection: {action:"create_collection", backend, schema:{name, type:"base", schema:[{name, type:"text"}]}}
 - list_records: {action:"list_records", backend, collection, query:{page,perPage,filter,sort}}
@@ -204,7 +189,7 @@ async function runAgent(message) {
   const action = await interpretCommand(message, conns);
   switch (action.action) {
     case 'provision_backend': {
-      return await provisionLocalBackend(action.name);
+      return await provisionDockerBackend(action.name);
     }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
@@ -266,18 +251,15 @@ function findBackend(backend) {
   throw new Error(backend ? `Backend "${backend}" not found` : 'No backend specified and multiple backends available');
 }
 
-// ---------- Local Provisioning ----------
-async function provisionLocalBackend(name = '') {
-  const instancesDir = './pb_instances';
-  if (!fs.existsSync(instancesDir)) fs.mkdirSync(instancesDir, { recursive: true });
+// ---------- Docker Provisioning ----------
+async function provisionDockerBackend(name = '') {
   const serviceName = (name || 'pb-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const dir = `${instancesDir}/${serviceName}`;
-  if (fs.existsSync(dir)) throw new Error('Instance already exists');
-  fs.mkdirSync(dir, { recursive: true });
+  const adminEmail = 'admin@' + serviceName + '.com';
+  const adminPassword = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 
   // Find free port
-  let port = 8091;
   const net = require('net');
+  let port = 8091;
   while (true) {
     const server = net.createServer();
     const isFree = await new Promise(resolve => {
@@ -289,23 +271,12 @@ async function provisionLocalBackend(name = '') {
     port++;
   }
 
-  const adminEmail = 'admin@' + serviceName + '.com';
-  const adminPassword = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const containerName = 'blubase-' + serviceName;
+  try { execSync('docker rm -f ' + containerName, { stdio: 'ignore' }); } catch (e) {}
 
-  const pbBinary = './pocketbase';
-  if (!fs.existsSync(pbBinary)) throw new Error('pocketbase binary not found');
-
-  const child = spawn(pbBinary, ['serve', `--http=127.0.0.1:${port}`, `--dir=${dir}`], {
-    detached: true,
-    stdio: 'ignore'
-  });
-  child.unref();
-
-  await new Promise(resolve => setTimeout(resolve, 3000));
-
-  try {
-    execSync(`${pbBinary} admin create ${adminEmail} ${adminPassword} --dir=${dir}`, { stdio: 'ignore' });
-  } catch (e) { /* ignore if exists */ }
+  const dockerCmd = `docker run -d --name ${containerName} --network host -v ${serviceName}_pb_data:/pb_data -e POCKETBASE_ADMIN_EMAIL=${adminEmail} -e POCKETBASE_ADMIN_PASSWORD=${adminPassword} blubase-pocketbase:latest /app/pocketbase serve --http=0.0.0.0:${port}`;
+  execSync(dockerCmd, { stdio: 'pipe' });
+  await new Promise(resolve => setTimeout(resolve, 5000));
 
   const url = `http://127.0.0.1:${port}`;
   const conn = await addConnection({
@@ -313,20 +284,20 @@ async function provisionLocalBackend(name = '') {
     name: serviceName,
     url: url,
     email: adminEmail,
-    password: adminPassword
+    password: adminPassword,
   });
 
   return {
     success: true,
-    message: 'Backend created locally',
+    message: 'Backend provisioned via Docker',
     connection: {
       id: conn.id,
       type: conn.type,
       name: conn.name,
       url: conn.url,
       email: adminEmail,
-      password: adminPassword
-    }
+      password: adminPassword,
+    },
   };
 }
 
@@ -366,7 +337,7 @@ app.post('/agent/command', async (req, res, next) => {
 app.post('/provision', async (req, res, next) => {
   try {
     const { name } = req.body;
-    res.json(await provisionLocalBackend(name));
+    res.json(await provisionDockerBackend(name));
   } catch (err) { next(err); }
 });
 
