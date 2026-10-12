@@ -10,7 +10,13 @@ const PocketBase = PocketBaseModule.default || PocketBaseModule.PocketBase || Po
 const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-api-key', 'Authorization'],
+  credentials: false
+}));
+app.options('*', cors());
 app.use(express.json());
 
 const config = {
