@@ -223,19 +223,67 @@ Actions:
 - call_edge_function: {action:"call_edge_function", backend, function, data:{}}
 - help: {action:"help", message}
 Return ONLY JSON.`;
-  const res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.llm.apiKey}` },
-    body: JSON.stringify({ model: config.llm.model, messages: [{ role: 'system', content: system }, { role: 'user', content: message }], temperature: 0.1, response_format: { type: 'json_object' } })
-  });
-  if (!res.ok) throw new Error(`LLM error: ${res.status} ${await res.text()}`);
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content || '{}';
-  return JSON.parse(content);
+  const models = [config.llm.model, 'mistral-tiny-latest', 'open-mistral-7b', 'mistral-small-latest'];
+  const uniqueModels = [...new Set(models)];
+  let lastError = null;
+
+  for (const model of uniqueModels) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.llm.apiKey}` },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'system', content: system }, { role: 'user', content: message }],
+            temperature: 0.1,
+            response_format: { type: 'json_object' }
+          })
+        });
+
+        if (res.status === 429) {
+          console.log(`Rate limit hit on ${model}, retrying in 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          lastError = 'rate_limited';
+          continue;
+        }
+        if (!res.ok) {
+          lastError = `LLM error: ${res.status} ${await res.text()}`;
+          break;
+        }
+        const data = await res.json();
+        const content = data.choices?.[0]?.message?.content || '{}';
+        return JSON.parse(content);
+      } catch (err) {
+        lastError = err.message;
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+  }
+  throw new Error('All LLM models failed: ' + lastError);
 }
 
 async function runAgent(message) {
   const conns = Array.from(connections.values());
-  const action = await interpretCommand(message, conns);
+  let action;
+  try {
+    action = await interpretCommand(message, conns);
+  } catch (err) {
+    console.error('LLM unavailable:', err.message);
+    // Simple keyword fallback when LLM is rate-limited
+    const lower = message.toLowerCase();
+    if (lower.includes('create') && (lower.includes('backend') || lower.includes('app'))) {
+      return await provisionLocalBackend(message.replace(/.*for (?:my )?/i, '').trim() || undefined);
+    }
+    if (lower.includes('list') && lower.includes('connection')) {
+      return { success: true, connections: listConnections() };
+    }
+    return {
+      success: false,
+      message: 'AI is temporarily rate-limited. Try again in 30 seconds, or use /provision directly.',
+      llmError: err.message
+    };
+  }
   switch (action.action) {
     case 'provision_backend': {
       return await provisionLocalBackend(action.name);
