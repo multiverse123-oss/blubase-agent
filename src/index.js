@@ -222,6 +222,8 @@ Actions:
 - delete_record: {action:"delete_record", backend, collection, id}
 - call_edge_function: {action:"call_edge_function", backend, function, data:{}}
 - help: {action:"help", message}
+If the user sends a greeting (hello, hi, hey, good morning) or a general question, respond with: {"action":"help","message":"Hi! I'm BluBase Agent. I can create backends, manage collections, handle records, and more. What would you like to build today?"}
+
 Return ONLY JSON.`;
   const models = [config.llm.model, 'mistral-tiny-latest', 'open-mistral-7b', 'mistral-small-latest'];
   const uniqueModels = [...new Set(models)];
