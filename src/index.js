@@ -467,6 +467,7 @@ app.post('/connect', async (req, res, next) => {
 
 app.get('/connections', (_req, res) => res.json(listConnections()));
 
+// Ensure this route is correctly defined for POST requests only.
 app.post('/agent/command', async (req, res, next) => {
   try {
     const { message } = req.body;
