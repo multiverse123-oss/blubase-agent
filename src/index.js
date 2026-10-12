@@ -542,5 +542,5 @@ app.use((err, _req, res, _next) => {
       }
     }
   }
-  app.listen(config.port, () => console.log(`🚀 BluBase Agent running on port ${config.port}`));
+  app.listen(config.port, '0.0.0.0', () => console.log(`🚀 BluBase Agent running on PORT ${config.port}`));
 })();

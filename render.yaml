@@ -6,40 +6,4 @@ services:
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
-    envVars:
-      - key: BLUBASE_API_KEY
-        sync: false
-      - key: AGENT_LLM_API_KEY
-        sync: false
-      - key: AGENT_LLM_BASE_URL
-        value: https://api.mistral.ai/v1
-      - key: AGENT_LLM_MODEL
-        value: mistral-small-latest
-      - key: POCKETBASE_URL
-        sync: false
-      - key: POCKETBASE_EMAIL
-        sync: false
-      - key: POCKETBASE_PASSWORD
-        sync: false
-      - key: SILOBASE_URL
-        sync: false
-      - key: SILOBASE_EMAIL
-        sync: false
-      - key: SILOBASE_PASSWORD
-        sync: false
-      - key: CUSTOM_BACKEND_URL
-        sync: false
-      - key: CUSTOM_BACKEND_TOKEN
-        sync: false
-      - key: IDRIVE_E2_ACCESS_KEY_ID
-        sync: false
-      - key: IDRIVE_E2_SECRET_ACCESS_KEY
-        sync: false
-      - key: IDRIVE_E2_BUCKET_NAME
-        sync: false
-      - key: IDRIVE_E2_ENDPOINT
-        sync: false
-      - key: IDRIVE_E2_REGION
-        sync: false
-      - key: RENDER_API_KEY
-        sync: false
+    autoDeploy: yes
