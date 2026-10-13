@@ -527,6 +527,8 @@ app.get('/', (_req, res) => res.json({
   }
 }));
 
+app.use('/agent/firebase', firebaseRoutes);
+
 app.use((err, _req, res, _next) => {
   console.error('ERROR:', err);
   res.status(500).json({ error: err.message || 'Internal server error' });
