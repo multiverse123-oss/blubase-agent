@@ -265,7 +265,7 @@ Return ONLY JSON.`;
   throw new Error('All LLM models failed: ' + lastError);
 }
 
-async function runAgent(message) {
+async function runAgent(message, req) {
   const conns = Array.from(connections.values());
   let action;
   try {
@@ -288,7 +288,8 @@ async function runAgent(message) {
   }
   switch (action.action) {
     case 'provision_backend': {
-      return await provisionLocalBackend(action.name);
+      const baseUrl = req ? `${req.protocol}://${req.get('host')}` : 'https://blubase-agent.onrender.com';
+      return await provisionLocalBackend(action.name, baseUrl);
     }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
@@ -361,7 +362,7 @@ function findBackend(backend) {
 }
 
 // Provisioning: create local PocketBase instance and expose via path URL
-async function provisionLocalBackend(name = '') {
+async function provisionLocalBackend(name = '', baseUrl = 'https://blubase-agent.onrender.com') {
   const serviceName = (name || 'pb-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
   const adminEmail = 'admin@' + serviceName + '.com';
   const adminPassword = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
@@ -397,7 +398,7 @@ async function provisionLocalBackend(name = '') {
     execSync(`${pbBinary} admin create ${adminEmail} ${adminPassword} --dir=${dir}`, { stdio: 'ignore' });
   } catch (e) {}
 
-  const publicUrl = `https://blubase-agent.onrender.com/backend/${serviceName}`;
+  const publicUrl = `${baseUrl}/backend/${serviceName}`;
   const conn = await addConnection({
     type: 'pocketbase',
     name: serviceName,
@@ -474,14 +475,15 @@ app.post('/agent/command', async (req, res, next) => {
   try {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: 'message is required' });
-    res.json(await runAgent(message));
+    res.json(await runAgent(message, req));
   } catch (err) { next(err); }
 });
 
 app.post('/provision', async (req, res, next) => {
   try {
     const { name } = req.body;
-    res.json(await provisionLocalBackend(name));
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    res.json(await provisionLocalBackend(name, baseUrl));
   } catch (err) { next(err); }
 });
 
