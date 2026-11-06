@@ -249,8 +249,22 @@ async function runAgent(message, req, userId, sessionId) {
   let result;
   switch (action.action) {
     case 'provision_backend': {
-      const baseUrl = req ? `${req.protocol}://${req.get('host')}` : 'https://blubase-agent.onrender.com';
-      return await provisionLocalBackend(action.name, baseUrl);
+      const proto = (req && (req.get('x-forwarded-proto') || 'https')) || 'https';
+      const baseUrl = req ? `${proto}://${req.get('host')}` : 'https://blubase-agent-1.onrender.com';
+      const provisionResult = await provisionLocalBackend(action.name, baseUrl);
+      if (provisionResult.success && provisionResult.connection) {
+        await memory.linkUserBackend(userId, {
+          name: provisionResult.connection.name,
+          type: provisionResult.connection.type,
+          url: provisionResult.connection.url
+        });
+      }
+      result = { ...provisionResult, nextSteps: [
+        `Create your first collection: "add a tasks collection with title and done fields"`,
+        `List your backends: "what backends do I have?"`,
+        `Connect your frontend to: ${provisionResult.connection?.url || ''}`
+      ]};
+      break;
     }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
