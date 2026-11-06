@@ -1,4 +1,5 @@
 require('dotenv').config();
+const memory = require('./memory');
 const firebaseRoutes = require('./routes/firebaseRoutes');
 const express = require('express');
 const cors = require('cors');
@@ -182,63 +183,13 @@ class RestAdapter {
   async auth() {
     if (this.token) return;
     if (this.conn.email && this.conn.password) {
-      const res = await fetch(`${this.baseUrl}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ identity: this.conn.email, password: this.conn.password }) });
-      if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
-      const data = await res.json();
-      this.token = data.token || data.access_token || data.data?.token;
-      if (!this.token) throw new Error('Token not found');
-    } else throw new Error('REST backend requires email/password or token');
-  }
-  async request(path, options = {}) {
-    await this.auth();
-    const headers = { 'Content-Type': 'application/json', ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}), ...options.headers };
-    const res = await fetch(`${this.baseUrl}${path}`, { ...options, headers });
-    if (!res.ok) throw new Error(`Request failed: ${res.status} ${await res.text()}`);
-    return res.json();
-  }
-  list(collection, query = {}) { const qs = new URLSearchParams(query).toString(); return this.request(`/api/collections/${collection}/records${qs ? `?${qs}` : ''}`); }
-  create(collection, data) { return this.request(`/api/collections/${collection}/records`, { method: 'POST', body: JSON.stringify(data) }); }
-  update(collection, id, data) { return this.request(`/api/collections/${collection}/records/${id}`, { method: 'PATCH', body: JSON.stringify(data) }); }
-  delete(collection, id) { return this.request(`/api/collections/${collection}/records/${id}`, { method: 'DELETE' }); }
-  getCollections() { return this.request('/api/collections'); }
-  createCollection(schema) { return this.request('/api/collections', { method: 'POST', body: JSON.stringify(schema) }); }
-  callEdgeFunction(name, payload) { return this.request(`/api/functions/${name}`, { method: 'POST', body: JSON.stringify(payload) }); }
-}
-
-function getAdapter(conn) { return conn.type === 'pocketbase' ? new PocketBaseAdapter(conn) : new RestAdapter(conn); }
-
-// LLM Agent (same as before)
-async function interpretCommand(message, conns) {
-  if (!config.llm.apiKey) throw new Error('AGENT_LLM_API_KEY not set');
-  const system = `You are BluBase Agent. Convert user request to JSON action.
-Available backends: ${JSON.stringify(conns.map(c => ({ id: c.id, name: c.name, type: c.type, url: c.url })))}.
-Actions:
-- provision_backend: {action:"provision_backend", name:"optional-name"}
-- connect: {action:"connect", backend:"pocketbase|silobase|custom", name, url, email, password, token}
-- list_collections: {action:"list_collections", backend:"name|id"}
-- create_collection: {action:"create_collection", backend, schema:{name, type:"base", schema:[{name, type:"text"}]}}
-- list_records: {action:"list_records", backend, collection, query:{page,perPage,filter,sort}}
-- create_record: {action:"create_record", backend, collection, data:{}}
-- update_record: {action:"update_record", backend, collection, id, data:{}}
-- delete_record: {action:"delete_record", backend, collection, id}
-- call_edge_function: {action:"call_edge_function", backend, function, data:{}}
-- help: {action:"help", message}
-If the user sends a greeting (hello, hi, hey, good morning) or a general question, respond with: {"action":"help","message":"Hi! I'm BluBase Agent. I can create backends, manage collections, handle records, and more. What would you like to build today?"}
-
-Return ONLY JSON.`;
-  const models = [config.llm.model, 'mistral-tiny-latest', 'open-mistral-7b', 'mistral-small-latest'];
-  const uniqueModels = [...new Set(models)];
-  let lastError = null;
-
-  for (const model of uniqueModels) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.llm.apiKey}` },
-          body: JSON.stringify({
+      const res = await fetch(`${this.baseUrl}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
             model,
-            messages: [{ role: 'system', content: system }, { role: 'user', content: message }],
+            messages: [
+              { role: 'system', content: system },
+              ...(context.history || []).map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) })),
+              { role: 'user', content: message }
+            ],
             temperature: 0.1,
             response_format: { type: 'json_object' }
           })
@@ -266,11 +217,19 @@ Return ONLY JSON.`;
   throw new Error('All LLM models failed: ' + lastError);
 }
 
-async function runAgent(message, req) {
+async function runAgent(message, req, userId, sessionId) {
   const conns = Array.from(connections.values());
+  const session = sessionId ? await memory.getSession(sessionId) : { messages: [] };
+  const userBackends = userId ? await memory.getUserBackends(userId) : [];
+  const context = { userId, userBackends, history: session.messages.slice(-6) };
+
+  if (sessionId && userId) {
+    await memory.addSessionMessage(sessionId, userId, 'user', message);
+  }
+
   let action;
   try {
-    action = await interpretCommand(message, conns);
+    action = await interpretCommand(message, conns, context);
   } catch (err) {
     console.error('LLM unavailable:', err.message);
     // Simple keyword fallback when LLM is rate-limited
@@ -287,6 +246,7 @@ async function runAgent(message, req) {
       llmError: err.message
     };
   }
+  let result;
   switch (action.action) {
     case 'provision_backend': {
       const baseUrl = req ? `${req.protocol}://${req.get('host')}` : 'https://blubase-agent.onrender.com';
@@ -294,7 +254,7 @@ async function runAgent(message, req) {
     }
     case 'connect': {
       if (!action.url) throw new Error('Connect requires url');
-      const conn = await addConnection({ type: action.backend || 'custom', name: action.name, url: action.url, email: action.email, password: action.password, token: action.token });
+      const conn = await addConnection({ type: action.backend || 'custom', name: action.name, url: action.url, email: action.email, password: action.password, token: action.token, userId });
       if (conn.type === 'pocketbase') {
         await startLocalInstance(conn);
         conn.localUrl = (await startLocalInstance(conn)).url;
@@ -345,11 +305,35 @@ async function runAgent(message, req) {
       const adapter = getAdapter(conn);
       return { success: true, backend: conn.name, function: action.function, result: await adapter.callEdgeFunction(action.function || '', action.data || {}) };
     }
+    case 'list_user_backends': {
+      result = { success: true, userId, backends: userBackends, count: userBackends.length };
+      break;
+    }
+    case 'suggest_next_steps': {
+      const conn = findBackend(action.backend);
+      result = {
+        success: true,
+        backend: conn.name,
+        nextSteps: [
+          `Create a collection in ${conn.name} — e.g. "add a tasks collection with title and done fields"`,
+          `List collections: "show collections in ${conn.name}"`,
+          `Connect this to your frontend: ${conn.url}`,
+          `View schema: "describe the tasks collection"`
+        ]
+      };
+      break;
+    }
     case 'help':
-      return { success: false, message: action.message || 'Please clarify.' };
+      result = { success: false, message: action.message || 'Please clarify.' };
+      break;
     default:
       throw new Error('Unknown action');
   }
+
+  if (sessionId && userId && result) {
+    await memory.addSessionMessage(sessionId, userId, 'agent', result);
+  }
+  return result;
 }
 
 function findBackend(backend) {
@@ -474,9 +458,11 @@ app.get('/connections', (_req, res) => res.json(listConnections()));
 // Ensure this route is correctly defined for POST requests only.
 app.post('/agent/command', async (req, res, next) => {
   try {
-    const { message } = req.body;
+    const { message, userId, sessionId } = req.body;
     if (!message) return res.status(400).json({ error: 'message is required' });
-    res.json(await runAgent(message, req));
+    const sid = sessionId || 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const response = await runAgent(message, req, userId, sid);
+    res.json({ ...response, sessionId: sid });
   } catch (err) { next(err); }
 });
 
