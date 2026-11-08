@@ -144,8 +144,18 @@ class PocketBaseAdapter {
   async createCollection(schema) {
     await this.auth();
     if (schema.fields && !schema.schema) { schema.schema = schema.fields; delete schema.fields; }
-    if (!schema.type) schema.type = 'base';
+    if (!schema.type) schema.type = "base";
     if (!schema.schema) schema.schema = [];
+    schema.schema = schema.schema.map(function(f) {
+      return {
+        name: f.name,
+        type: f.type || "text",
+        required: !!f.required,
+        presentable: !!f.presentable,
+        unique: !!f.unique,
+        options: f.options || {}
+      };
+    });
     return this.pb.collections.create(schema);
   }
   async callEdgeFunction(name, payload) {
@@ -271,6 +281,58 @@ async function interpretCommand(message, conns, context) {
 }
 
 // ============================================================
+// Firebase provisioning helper
+// ============================================================
+async function provisionFirebaseBackend(firebaseUid, projectId, projectName, template) {
+  const fb = require("./firebase");
+  if (!fb.isReady()) throw new Error("Firebase not configured on this agent");
+  const db = fb.db;
+  const FieldValue = fb.FieldValue;
+
+  const existing = await db.collection("user_projects").where("projectId", "==", projectId).limit(1).get();
+  if (!existing.empty) {
+    const doc = existing.docs[0];
+    return {
+      success: true,
+      provider: "firebase",
+      existed: true,
+      firebaseProjectId: "multiverse-backends",
+      firebaseConfig: fb.firebaseConfig,
+      userProjectsDocId: doc.id,
+      seededCollections: []
+    };
+  }
+
+  const docRef = await db.collection("user_projects").add({
+    userId: firebaseUid,
+    projectId: projectId,
+    name: projectName || "Untitled Project",
+    firebaseConfig: fb.firebaseConfig,
+    collections: [],
+    status: "active",
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp()
+  });
+
+  await db.collection("project_logs").add({
+    projectId: projectId,
+    userId: firebaseUid,
+    action: "firebase_provisioned",
+    details: { template: template || "blank", source: "agent_nl" },
+    createdAt: FieldValue.serverTimestamp()
+  });
+
+  return {
+    success: true,
+    provider: "firebase",
+    firebaseProjectId: "multiverse-backends",
+    firebaseConfig: fb.firebaseConfig,
+    userProjectsDocId: docRef.id,
+    seededCollections: []
+  };
+}
+
+// ============================================================
 // findBackend
 // ============================================================
 function findBackend(backend) {
@@ -361,6 +423,34 @@ async function runAgent(message, req, userId, sessionId) {
 
   if (sessionId && userId) {
     await memory.addSessionMessage(sessionId, userId, 'user', message);
+  }
+
+  // Deterministic Firebase short-circuit
+  const lmFirebase = (message || "").toLowerCase();
+  if (lmFirebase.indexOf("firebase") !== -1 && (lmFirebase.indexOf("create") !== -1 || lmFirebase.indexOf("provision") !== -1 || lmFirebase.indexOf("add") !== -1 || lmFirebase.indexOf("make") !== -1)) {
+    try {
+      let projName = "firebase-app-" + Date.now().toString(36);
+      const m = message.match(/(?:for|named|called)\s+(?:my\s+)?([a-zA-Z0-9_\- ]+?)(?:\s+app|\s+backend|\s+project|$)/i);
+      if (m && m[1]) projName = m[1].trim().toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      const projId = projName + "-" + Date.now().toString(36);
+      const fbResult = await provisionFirebaseBackend(userId || "anon", projId, projName, "blank");
+      if (userId) {
+        await memory.linkUserBackend(userId, { name: projName, type: "firebase", url: "https://multiverse-backends.firebaseapp.com", projectId: projId });
+      }
+      const r = Object.assign({}, fbResult, {
+        connection: { name: projName, type: "firebase", projectId: projId, firebaseConfig: fbResult.firebaseConfig },
+        nextSteps: [
+          "Add a collection: send the same message in this session and I will extend your Firebase data",
+          "List your backends: \"what backends do I have?\"",
+          "Frontend can connect with the firebaseConfig field"
+        ]
+      });
+      if (sessionId && userId) await memory.addSessionMessage(sessionId, userId, "agent", r);
+      return r;
+    } catch (fbErr) {
+      console.error("[Firebase] short-circuit failed:", fbErr.message);
+      return { success: false, provider: "firebase", error: fbErr.message };
+    }
   }
 
   // Deterministic short-circuit for "list my backends"
