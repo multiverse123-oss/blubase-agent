@@ -377,11 +377,39 @@ async function provisionLocalBackend(name, baseUrl) {
 
   const child = spawn(pbBinary, ['serve', '--http=127.0.0.1:' + port, '--dir=' + dir], { detached: true, stdio: 'ignore' });
   child.unref();
-  await new Promise(function(r) { setTimeout(r, 3000); });
+  // READINESS_CHECK: wait for PocketBase to actually be ready
+  let pbReady = false;
+  for (let wait = 0; wait < 20; wait++) {
+    await new Promise(function(r) { setTimeout(r, 500); });
+    try {
+      const probe = await fetch('http://127.0.0.1:' + port + '/api/health');
+      if (probe.ok) { pbReady = true; console.log('[PB ' + serviceName + '] ready after ' + ((wait + 1) * 500) + 'ms'); break; }
+    } catch (e) {}
+  }
+  if (!pbReady) throw new Error('PocketBase did not become ready in 10s');
 
   try {
-    execSync(pbBinary + ' admin create ' + adminEmail + ' ' + adminPassword + ' --dir=' + dir, { stdio: 'ignore' });
-  } catch (e) {}
+    const out = execSync(pbBinary + ' --dir=' + dir + ' admin create ' + adminEmail + ' ' + adminPassword, { stdio: 'pipe' });
+    console.log('[PB ' + serviceName + '] admin created: ' + out.toString().trim());
+  } catch (cliErr) {
+    console.log('[PB ' + serviceName + '] admin create failed (CLI): ' + cliErr.message);
+    if (cliErr.stderr) console.log('  stderr: ' + cliErr.stderr.toString().trim());
+    // Fallback: create superuser via HTTP API
+    try {
+      const adminRes = await fetch('http://127.0.0.1:' + port + '/api/admins', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: adminEmail, password: adminPassword, passwordConfirm: adminPassword })
+      });
+      if (adminRes.ok) {
+        console.log('[PB ' + serviceName + '] admin created via HTTP fallback');
+      } else {
+        console.log('[PB ' + serviceName + '] HTTP admin fallback failed: ' + adminRes.status + ' ' + (await adminRes.text()));
+      }
+    } catch (httpErr) {
+      console.log('[PB ' + serviceName + '] HTTP admin fallback error: ' + httpErr.message);
+    }
+  }
 
   const publicUrl = baseUrl + '/backend/' + serviceName;
   const conn = await addConnection({
